@@ -1,0 +1,578 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0"/>
+  <title>Smart Solar Parking</title>
+  <script src="https://cdn.tailwindcss.com"></script>
+  <link rel="manifest" href="manifest.json" />
+  <link rel="apple-touch-icon" href="icon-192.png" />
+  <meta name="theme-color" content="#10b981"/>
+  <style>
+    body.dark-mode {
+      background-color: #111827;
+      color: #f9fafb;
+    }
+    .status-online { color: #10b981; }
+    .status-offline { color: #ef4444; }
+    .slot-available { background-color: #dcfce7; border-color: #16a34a; }
+    .slot-occupied { background-color: #fee2e2; border-color: #dc2626; }
+    .slot-available.dark { background-color: #14532d; }
+    .slot-occupied.dark { background-color: #7f1d1d; }
+  </style>
+</head>
+<body class="bg-gray-100 text-gray-900 min-h-screen font-sans">
+  <div id="app" class="flex flex-col min-h-screen">
+    <!-- Header -->
+    <header class="bg-green-700 text-white p-4 shadow-md">
+      <div class="max-w-6xl mx-auto flex justify-between items-center">
+        <h1 class="text-xl font-bold">Smart Solar Parking</h1>
+        <div class="flex items-center space-x-4">
+          <div id="mqttStatus" class="text-sm">
+            <span id="statusText">MQTT: Disconnected</span>
+            <span id="statusIcon" class="status-offline">●</span>
+          </div>
+          <nav class="space-x-4">
+            <button onclick="navigate('main-menu')" class="hover:underline">Main Menu</button>
+            <button onclick="navigate('system')" class="hover:underline">System</button>
+            <button onclick="navigate('control')" class="hover:underline">Control</button>
+            <button onclick="navigate('about')" class="hover:underline">About</button>
+            <button onclick="navigate('settings')" class="hover:underline">Settings</button>
+          </nav>
+        </div>
+      </div>
+    </header>
+
+    <!-- Main Content -->
+    <main id="content" class="flex-grow p-6 max-w-6xl mx-auto w-full"></main>
+
+    <!-- Footer -->
+    <footer class="text-center text-sm py-4 mt-6 text-gray-500">
+      &copy; 2025 Smart Solar Parking System | Muhammad Rahmat Ikhwan
+    </footer>
+  </div>
+
+  <!-- MQTT.js CDN -->
+  <script src="https://unpkg.com/mqtt/dist/mqtt.min.js"></script>
+
+  <!-- App Logic -->
+  <script>
+    let currentPage = 'main-menu';
+    let darkMode = window.matchMedia && window.matchMedia('(prefers-color-scheme: dark)').matches;
+    let mqttClient = null;
+    let mqttConnected = false;
+
+    // System data
+    const systemData = {
+      slots: [
+        { id: 1, occupied: false, lastUpdate: Date.now() },
+        { id: 2, occupied: false, lastUpdate: Date.now() },
+        { id: 3, occupied: false, lastUpdate: Date.now() }
+      ],
+      rfid: {
+        lastCard: '',
+        authenticated: false,
+        attempts: 0,
+        lastAttempt: Date.now()
+      },
+      power: {
+        solarOutput: 0,
+        batteryVoltage: 0,
+        batteryCapacity: 0,
+        status: 'Unknown'
+      },
+      gate: {
+        slot1: 'closed',
+        slot2: 'closed',
+        slot3: 'closed'
+      }
+    };
+
+    // MQTT Configuration
+    const mqttConfig = {
+      broker: 'wss://broker.hivemq.com:8884/mqtt',
+      topics: {
+        // Incoming from ESP32
+        slotStatus: 'smartparking/slots/status',
+        rfidAuth: 'smartparking/rfid/auth',
+        powerStatus: 'smartparking/power/status',
+        gateStatus: 'smartparking/gate/status',
+        systemStatus: 'smartparking/system/status',
+        
+        // Outgoing to ESP32
+        gateControl: 'smartparking/gate/control',
+        systemControl: 'smartparking/system/control',
+        rfidControl: 'smartparking/rfid/control'
+      }
+    };
+
+    function navigate(page) {
+      currentPage = page;
+      render();
+    }
+
+    function toggleDarkMode() {
+      darkMode = !darkMode;
+      document.body.classList.toggle('dark-mode', darkMode);
+      localStorage.setItem('darkMode', darkMode ? 'enabled' : 'disabled');
+      render();
+    }
+
+    function initMQTT() {
+      try {
+        mqttClient = mqtt.connect(mqttConfig.broker);
+
+        mqttClient.on('connect', () => {
+          console.log('Connected to MQTT Broker');
+          mqttConnected = true;
+          updateMQTTStatus(true);
+          
+          // Subscribe to all incoming topics
+          Object.values(mqttConfig.topics).forEach(topic => {
+            if (!topic.includes('/control')) {
+              mqttClient.subscribe(topic);
+              console.log(`Subscribed to: ${topic}`);
+            }
+          });
+        });
+
+        mqttClient.on('disconnect', () => {
+          console.log('Disconnected from MQTT Broker');
+          mqttConnected = false;
+          updateMQTTStatus(false);
+        });
+
+        mqttClient.on('error', (error) => {
+          console.error('MQTT Error:', error);
+          mqttConnected = false;
+          updateMQTTStatus(false);
+        });
+
+        mqttClient.on('message', (topic, message) => {
+          try {
+            const data = JSON.parse(message.toString());
+            handleMQTTMessage(topic, data);
+          } catch (e) {
+            console.error('Invalid JSON from MQTT:', e);
+          }
+        });
+
+      } catch (error) {
+        console.error('MQTT Connection Error:', error);
+      }
+    }
+
+    function handleMQTTMessage(topic, data) {
+      console.log(`Received: ${topic}`, data);
+      
+      switch (topic) {
+        case mqttConfig.topics.slotStatus:
+          if (data.slots) {
+            systemData.slots = data.slots.map(slot => ({
+              ...slot,
+              lastUpdate: Date.now()
+            }));
+          }
+          break;
+          
+        case mqttConfig.topics.rfidAuth:
+          systemData.rfid = {
+            ...systemData.rfid,
+            ...data,
+            lastAttempt: Date.now()
+          };
+          break;
+          
+        case mqttConfig.topics.powerStatus:
+          systemData.power = { ...systemData.power, ...data };
+          break;
+          
+        case mqttConfig.topics.gateStatus:
+          systemData.gate = { ...systemData.gate, ...data };
+          break;
+          
+        case mqttConfig.topics.systemStatus:
+          console.log('System Status:', data);
+          break;
+      }
+      
+      // Update UI if we're on the system page
+      if (currentPage === 'system') {
+        renderSystemPage();
+      }
+    }
+
+    function publishMQTT(topic, data) {
+      if (mqttConnected && mqttClient) {
+        mqttClient.publish(topic, JSON.stringify(data));
+        console.log(`Published to ${topic}:`, data);
+      } else {
+        console.warn('MQTT not connected');
+        alert('MQTT not connected. Please check connection.');
+      }
+    }
+
+    function updateMQTTStatus(connected) {
+      const statusText = document.getElementById('statusText');
+      const statusIcon = document.getElementById('statusIcon');
+      
+      if (connected) {
+        statusText.textContent = 'MQTT: Connected';
+        statusIcon.className = 'status-online';
+      } else {
+        statusText.textContent = 'MQTT: Disconnected';
+        statusIcon.className = 'status-offline';
+      }
+    }
+
+    function controlGate(slotId, action) {
+      const controlData = {
+        slot: slotId,
+        action: action, // 'open' or 'close'
+        timestamp: Date.now()
+      };
+      publishMQTT(mqttConfig.topics.gateControl, controlData);
+    }
+
+    function resetRFIDAttempts() {
+      const resetData = {
+        action: 'reset_attempts',
+        timestamp: Date.now()
+      };
+      publishMQTT(mqttConfig.topics.rfidControl, resetData);
+    }
+
+    function systemReset() {
+      const resetData = {
+        action: 'system_reset',
+        timestamp: Date.now()
+      };
+      publishMQTT(mqttConfig.topics.systemControl, resetData);
+    }
+
+    function render() {
+      const content = document.getElementById('content');
+      content.innerHTML = '';
+
+      if (currentPage === 'main-menu') {
+        content.innerHTML = `
+          <div class="max-w-lg mx-auto space-y-4 text-center">
+            <h2 class="text-2xl font-bold mb-6">Main Menu</h2>
+            <div class="grid grid-cols-1 gap-4">
+              <button onclick="navigate('system')" class="w-full py-4 bg-blue-600 hover:bg-blue-700 text-white rounded-lg transition text-lg">
+                📊 System Dashboard
+              </button>
+              <button onclick="navigate('control')" class="w-full py-4 bg-green-600 hover:bg-green-700 text-white rounded-lg transition text-lg">
+                🎮 Remote Control
+              </button>
+              <button onclick="navigate('about')" class="w-full py-4 bg-gray-500 hover:bg-gray-600 text-white rounded-lg transition text-lg">
+                ℹ️ About Project
+              </button>
+              <button onclick="navigate('settings')" class="w-full py-4 bg-purple-600 hover:bg-purple-700 text-white rounded-lg transition text-lg">
+                ⚙️ Settings
+              </button>
+            </div>
+          </div>
+        `;
+      } else if (currentPage === 'system') {
+        renderSystemPage();
+      } else if (currentPage === 'control') {
+        renderControlPage();
+      } else if (currentPage === 'about') {
+        content.innerHTML = `
+          <div class="p-6 space-y-6 ${darkMode ? 'bg-gray-800' : 'bg-white'} rounded-lg shadow">
+            <h2 class="text-2xl font-bold">About This Project</h2>
+            <p class="text-gray-600 ${darkMode ? 'text-gray-300' : ''}">
+              This system is a final year project for Bachelor of Electrical Engineering from UTeM. 
+              The project presents the development of a solar-powered anti-theft parking system using RFID communication technology.
+            </p>
+            <h3 class="text-xl font-semibold">Main Components:</h3>
+            <div class="grid grid-cols-2 gap-4">
+              <ul class="list-disc list-inside space-y-2">
+                <li>ESP32 Microcontroller</li>
+                <li>RFID RC522 Module</li>
+                <li>6W Solar Panel</li>
+                <li>3.7V Li-ion Battery</li>
+              </ul>
+              <ul class="list-disc list-inside space-y-2">
+                <li>Servo Motor for gates</li>
+                <li>16x2 LCD Display</li>
+                <li>MQTT IoT Communication</li>
+                <li>Web-based Dashboard</li>
+              </ul>
+            </div>
+            <div class="p-4 bg-blue-50 ${darkMode ? 'bg-blue-900' : ''} rounded-lg">
+              <h4 class="font-semibold mb-2">Project Objectives:</h4>
+              <p class="text-sm">
+                This project aims to improve parking security, save energy, and provide a better user experience 
+                through IoT integration and renewable energy utilization.
+              </p>
+            </div>
+          </div>
+        `;
+      } else if (currentPage === 'settings') {
+        content.innerHTML = `
+          <div class="p-6 space-y-6 ${darkMode ? 'bg-gray-800' : 'bg-white'} rounded-lg shadow">
+            <h2 class="text-2xl font-bold">Settings</h2>
+            <div class="space-y-4">
+              <div class="flex justify-between items-center p-4 border rounded-lg">
+                <div>
+                  <span class="font-medium">Dark Mode</span>
+                  <p class="text-sm text-gray-500">Toggle between light and dark theme</p>
+                </div>
+                <button onclick="toggleDarkMode()" class="px-4 py-2 rounded-lg ${darkMode ? 'bg-yellow-500 text-black' : 'bg-blue-600 text-white'} hover:opacity-90 transition">
+                  ${darkMode ? '☀️ Light Mode' : '🌙 Dark Mode'}
+                </button>
+              </div>
+              
+              <div class="p-4 border rounded-lg">
+                <h3 class="font-medium mb-2">MQTT Connection</h3>
+                <p class="text-sm text-gray-500 mb-2">Broker: ${mqttConfig.broker}</p>
+                <p class="text-sm">Status: <span class="${mqttConnected ? 'text-green-600' : 'text-red-600'}">${mqttConnected ? 'Connected' : 'Disconnected'}</span></p>
+                <button onclick="initMQTT()" class="mt-2 px-4 py-2 bg-blue-600 text-white rounded hover:bg-blue-700 transition">
+                  Reconnect MQTT
+                </button>
+              </div>
+              
+              <div class="p-4 border rounded-lg">
+                <h3 class="font-medium mb-2">System Information</h3>
+                <p class="text-sm text-gray-500">Last Update: ${new Date().toLocaleString()}</p>
+                <p class="text-sm text-gray-500">Total Parking Slots: 3</p>
+                <p class="text-sm text-gray-500">Available Slots: ${systemData.slots.filter(s => !s.occupied).length}</p>
+              </div>
+            </div>
+          </div>
+        `;
+      }
+    }
+
+    function renderSystemPage() {
+      const content = document.getElementById('content');
+      const availableSlots = systemData.slots.filter(s => !s.occupied).length;
+      
+      content.innerHTML = `
+        <div class="space-y-6">
+          <div class="text-center">
+            <h2 class="text-2xl font-bold mb-2">Parking System Dashboard</h2>
+            <p class="text-gray-600 ${darkMode ? 'text-gray-300' : ''}">Real-time monitoring via MQTT</p>
+          </div>
+
+          <!-- System Status Cards -->
+          <div class="grid grid-cols-1 md:grid-cols-3 gap-4">
+            <div class="p-4 ${darkMode ? 'bg-gray-800' : 'bg-white'} rounded-lg shadow">
+              <h3 class="font-semibold text-lg mb-2">🚗 Parking Status</h3>
+              <p class="text-2xl font-bold ${availableSlots > 0 ? 'text-green-600' : 'text-red-600'}">
+                ${availableSlots}/3 Available
+              </p>
+              <p class="text-sm text-gray-500">
+                ${availableSlots === 0 ? 'FULL' : availableSlots === 3 ? 'ALL OPEN' : 'PARTIALLY OCCUPIED'}
+              </p>
+            </div>
+            
+            <div class="p-4 ${darkMode ? 'bg-gray-800' : 'bg-white'} rounded-lg shadow">
+              <h3 class="font-semibold text-lg mb-2">🔋 Power Status</h3>
+              <p class="text-lg font-bold">
+                ${systemData.power.batteryVoltage}V
+              </p>
+              <p class="text-sm text-gray-500">
+                Solar: ${systemData.power.solarOutput}W | Status: ${systemData.power.status}
+              </p>
+            </div>
+            
+            <div class="p-4 ${darkMode ? 'bg-gray-800' : 'bg-white'} rounded-lg shadow">
+              <h3 class="font-semibold text-lg mb-2">🔐 RFID Status</h3>
+              <p class="text-lg font-bold ${systemData.rfid.authenticated ? 'text-green-600' : 'text-red-600'}">
+                ${systemData.rfid.authenticated ? 'Authenticated' : 'Standby'}
+              </p>
+              <p class="text-sm text-gray-500">
+                Failed Attempts: ${systemData.rfid.attempts}/3
+              </p>
+            </div>
+          </div>
+
+          <!-- Parking Slots -->
+          <div class="p-6 ${darkMode ? 'bg-gray-800' : 'bg-white'} rounded-lg shadow">
+            <h3 class="font-semibold text-lg mb-4">🅿️ Parking Slots</h3>
+            <div class="grid grid-cols-1 md:grid-cols-3 gap-4">
+              ${systemData.slots.map(slot => `
+                <div class="relative p-6 border-2 rounded-lg ${slot.occupied ? 'slot-occupied' : 'slot-available'} ${darkMode ? 'dark' : ''} transition-all">
+                  <div class="text-center">
+                    <div class="text-3xl mb-2">${slot.occupied ? '🚗' : '🅿️'}</div>
+                    <h4 class="font-bold text-lg">Slot ${slot.id}</h4>
+                    <p class="text-sm font-medium ${slot.occupied ? 'text-red-700' : 'text-green-700'}">
+                      ${slot.occupied ? 'OCCUPIED' : 'AVAILABLE'}
+                    </p>
+                    <p class="text-xs text-gray-500 mt-2">
+                      Gate: ${systemData.gate['slot' + slot.id]}
+                    </p>
+                    <p class="text-xs text-gray-500">
+                      Updated: ${new Date(slot.lastUpdate).toLocaleTimeString()}
+                    </p>
+                  </div>
+                </div>
+              `).join('')}
+            </div>
+          </div>
+
+          <!-- RFID Authentication -->
+          <div class="p-6 ${darkMode ? 'bg-gray-800' : 'bg-white'} rounded-lg shadow">
+            <h3 class="font-semibold text-lg mb-4">🔐 RFID Authentication</h3>
+            <div class="grid grid-cols-1 md:grid-cols-2 gap-4">
+              <div>
+                <p class="text-sm text-gray-500 mb-2">Last Card Scanned:</p>
+                <p class="font-mono text-sm bg-gray-100 ${darkMode ? 'bg-gray-700' : ''} p-2 rounded">
+                  ${systemData.rfid.lastCard || 'None'}
+                </p>
+              </div>
+              <div>
+                <p class="text-sm text-gray-500 mb-2">Authentication Status:</p>
+                <p class="font-bold ${systemData.rfid.authenticated ? 'text-green-600' : 'text-red-600'}">
+                  ${systemData.rfid.authenticated ? '✅ Authenticated' : '❌ Not Authenticated'}
+                </p>
+              </div>
+            </div>
+            <div class="mt-4 p-3 bg-yellow-50 ${darkMode ? 'bg-yellow-900' : ''} rounded border-l-4 border-yellow-400">
+              <p class="text-sm">
+                <strong>Security Alert:</strong> ${systemData.rfid.attempts}/3 failed attempts
+                ${systemData.rfid.attempts >= 3 ? ' - System locked!' : ''}
+              </p>
+            </div>
+          </div>
+        </div>
+      `;
+    }
+
+    function renderControlPage() {
+      const content = document.getElementById('content');
+      
+      content.innerHTML = `
+        <div class="space-y-6">
+          <div class="text-center">
+            <h2 class="text-2xl font-bold mb-2">Remote Control Panel</h2>
+            <p class="text-gray-600 ${darkMode ? 'text-gray-300' : ''}">Control parking gates and system functions</p>
+          </div>
+
+          <!-- Gate Control -->
+          <div class="p-6 ${darkMode ? 'bg-gray-800' : 'bg-white'} rounded-lg shadow">
+            <h3 class="font-semibold text-lg mb-4">🚪 Gate Control</h3>
+            <div class="grid grid-cols-1 md:grid-cols-3 gap-4">
+              ${systemData.slots.map(slot => `
+                <div class="p-4 border rounded-lg text-center">
+                  <h4 class="font-bold mb-2">Slot ${slot.id} Gate</h4>
+                  <p class="text-sm text-gray-500 mb-3">
+                    Status: <span class="font-medium">${systemData.gate['slot' + slot.id]}</span>
+                  </p>
+                  <div class="space-y-2">
+                    <button onclick="controlGate(${slot.id}, 'open')" 
+                            class="w-full px-4 py-2 bg-green-600 text-white rounded hover:bg-green-700 transition">
+                      Open Gate
+                    </button>
+                    <button onclick="controlGate(${slot.id}, 'close')" 
+                            class="w-full px-4 py-2 bg-red-600 text-white rounded hover:bg-red-700 transition">
+                      Close Gate
+                    </button>
+                  </div>
+                </div>
+              `).join('')}
+            </div>
+          </div>
+
+          <!-- System Control -->
+          <div class="p-6 ${darkMode ? 'bg-gray-800' : 'bg-white'} rounded-lg shadow">
+            <h3 class="font-semibold text-lg mb-4">🔧 System Control</h3>
+            <div class="grid grid-cols-1 md:grid-cols-2 gap-4">
+              <div class="p-4 border rounded-lg">
+                <h4 class="font-bold mb-2">RFID Management</h4>
+                <p class="text-sm text-gray-500 mb-3">Reset authentication attempts</p>
+                <button onclick="resetRFIDAttempts()" 
+                        class="w-full px-4 py-2 bg-blue-600 text-white rounded hover:bg-blue-700 transition">
+                  Reset RFID Attempts
+                </button>
+              </div>
+              
+              <div class="p-4 border rounded-lg">
+                <h4 class="font-bold mb-2">System Reset</h4>
+                <p class="text-sm text-gray-500 mb-3">Restart the entire system</p>
+                <button onclick="systemReset()" 
+                        class="w-full px-4 py-2 bg-red-600 text-white rounded hover:bg-red-700 transition">
+                  System Reset
+                </button>
+              </div>
+            </div>
+          </div>
+
+          <!-- Manual Commands -->
+          <div class="p-6 ${darkMode ? 'bg-gray-800' : 'bg-white'} rounded-lg shadow">
+            <h3 class="font-semibold text-lg mb-4">⌨️ Manual Commands</h3>
+            <div class="space-y-4">
+              <div>
+                <label class="block text-sm font-medium mb-2">Send Custom MQTT Message:</label>
+                <div class="flex gap-2">
+                  <select id="topicSelect" class="px-3 py-2 border rounded ${darkMode ? 'bg-gray-700 border-gray-600' : ''}">
+                    <option value="${mqttConfig.topics.gateControl}">Gate Control</option>
+                    <option value="${mqttConfig.topics.systemControl}">System Control</option>
+                    <option value="${mqttConfig.topics.rfidControl}">RFID Control</option>
+                  </select>
+                  <input type="text" id="messageInput" placeholder="Enter JSON message" 
+                         class="flex-1 px-3 py-2 border rounded ${darkMode ? 'bg-gray-700 border-gray-600' : ''}">
+                  <button onclick="sendCustomMessage()" 
+                          class="px-4 py-2 bg-purple-600 text-white rounded hover:bg-purple-700 transition">
+                    Send
+                  </button>
+                </div>
+              </div>
+            </div>
+          </div>
+        </div>
+      `;
+    }
+
+    function sendCustomMessage() {
+      const topic = document.getElementById('topicSelect').value;
+      const message = document.getElementById('messageInput').value;
+      
+      try {
+        const data = JSON.parse(message);
+        publishMQTT(topic, data);
+        document.getElementById('messageInput').value = '';
+        alert('Message sent successfully!');
+      } catch (e) {
+        alert('Invalid JSON format');
+      }
+    }
+
+    // Initialize app
+    document.addEventListener('DOMContentLoaded', () => {
+      const savedMode = localStorage.getItem('darkMode');
+      if (savedMode === 'enabled') {
+        darkMode = true;
+        document.body.classList.add('dark-mode');
+      }
+
+      initMQTT();
+      render();
+      
+      // Auto-refresh system data every 30 seconds
+      setInterval(() => {
+        if (currentPage === 'system') {
+          render();
+        }
+      }, 30000);
+    });
+
+    // Handle page visibility changes
+    document.addEventListener('visibilitychange', () => {
+      if (document.hidden) {
+        // Page is hidden
+        console.log('Page hidden');
+      } else {
+        // Page is visible
+        console.log('Page visible');
+        if (currentPage === 'system') {
+          render();
+        }
+      }
+    });
+  </script>
+</body>
+</html>
